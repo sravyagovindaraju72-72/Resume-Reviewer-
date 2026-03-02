@@ -79,6 +79,52 @@ ROLE_FAMILY_WORDS = {
     "counsellor", "social", "speech", "finance", "product", "marketing", "sales"
 }
 
+STRONG_VERBS = {
+    "achieved", "administered", "architected", "automated", "built", "consolidated",
+    "created", "decreased", "delivered", "deployed", "designed", "developed",
+    "directed", "drove", "eliminated", "enabled", "engineered", "established",
+    "exceeded", "executed", "expanded", "generated", "grew", "implemented",
+    "improved", "increased", "integrated", "introduced", "launched", "led",
+    "managed", "mentored", "migrated", "negotiated", "optimized", "orchestrated",
+    "overhauled", "pioneered", "produced", "reduced", "refactored", "redesigned",
+    "resolved", "revamped", "scaled", "secured", "shipped", "simplified",
+    "spearheaded", "streamlined", "strengthened", "trained", "transformed",
+    "upgraded"
+}
+
+WEAK_VERBS = {
+    "aided", "assisted", "contributed", "did", "got", "handled", "helped",
+    "involved", "made", "oversaw", "participated", "performed", "responsible",
+    "served", "supported", "tasked", "used", "utilized", "was", "went", "worked"
+}
+
+METRIC_PATTERN = re.compile(
+    r'\b\d[\d,]*\.?\d*\s*(%|percent|x\b|times|hours?|days?|weeks?|months?'
+    r'|years?|users?|customers?|clients?|requests?|ms\b|seconds?|k\b|m\b|K\b|M\b'
+    r'|projects?|teams?|members?|people|employees?|reports?|accounts?'
+    r'|transactions?|records?|tickets?|applications?|endpoints?|points?)'
+    r'|\$[\d,]+\.?\d*'
+    r'|\d+[xX]\b'
+    r'|\d+\+\s*(years?|users?|customers?|projects?|people|members?)'
+    r'|\d+%',
+    re.IGNORECASE
+)
+
+SECTION_HEADERS = {
+    "summary": ["summary", "objective", "profile", "about", "about me",
+                 "professional summary", "career summary", "career objective"],
+    "experience": ["experience", "work experience", "employment", "work history",
+                    "internship", "internships", "professional experience",
+                    "relevant experience", "career history"],
+    "skills": ["skills", "technical skills", "core competencies", "technologies",
+               "tools", "proficiencies", "competencies", "areas of expertise",
+               "technical proficiencies", "key skills"],
+    "education": ["education", "academic background", "degrees", "academic",
+                   "academic history"],
+    "projects": ["projects", "personal projects", "portfolio", "selected projects",
+                  "academic projects", "side projects", "key projects"],
+}
+
 
 # ─── File parsers ─────────────────────────────────────────────────────────────
 def read_pdf(file_bytes):
@@ -144,6 +190,17 @@ def keyword_quality(term):
         return False
     if len(words) == 2 and any(word in COMMON_WORDS for word in words):
         return False
+    # Reject concatenated list items: multi-word terms that are just adjacent
+    # items from comma-separated skill lists (TF-IDF artifacts).
+    if len(words) == 3 and term not in KNOWN_SKILL_PHRASES:
+        # If 2+ words are short standalone terms, likely a list artifact
+        short_count = sum(1 for w in words if len(w) <= 6)
+        if short_count >= 2:
+            return False
+    # Reject 2-word terms where both words are very short standalone terms
+    if len(words) == 2 and all(len(w) <= 5 for w in words):
+        if term not in KNOWN_SKILL_PHRASES:
+            return False
     return True
 
 def normalize_keyword_word(word):
@@ -330,20 +387,260 @@ def distinct_phrases_from_text(text, limit=5):
             break
     return phrases
 
+SECTION_BREAK_WORDS = {
+    "summary", "experience", "projects", "skills", "education", "certifications",
+    "activities", "leadership", "awards", "contact"
+}
+
+def split_resume_segments(resume_text):
+    text = str(resume_text).replace("\r", "\n")
+    text = re.sub(r"\s*[|]\s*", " | ", text)
+    text = re.sub(r"\s*[•]\s*", "\n• ", text)
+    text = re.sub(r"\s+-\s+", "\n- ", text)
+    text = re.sub(r"(?<!\n)(Summary|Experience|Projects|Skills|Education|Certifications|Activities|Leadership|Awards)\b", r"\n\1", text)
+    segments = []
+    for line in text.splitlines():
+        line = clean_text(line)
+        if line:
+            segments.append(line)
+    return segments
+
+def looks_like_resume_header(line):
+    line_lower = line.lower()
+    if "@" in line_lower or "linkedin" in line_lower or "github" in line_lower:
+        return True
+    words = line.split()
+    if len(words) <= 8 and all(word.lower().strip(":") in SECTION_BREAK_WORDS for word in words):
+        return True
+    return False
+
 def extract_resume_bullets(resume_text, limit=6):
     bullets = []
-    for line in str(resume_text).splitlines():
-        line = clean_text(line)
-        if not line:
+    segments = split_resume_segments(resume_text)
+    for line in segments:
+        if looks_like_resume_header(line):
             continue
         if line.startswith(("-", "•", "*")):
             line = clean_text(line[1:])
-        if len(line.split()) < 6:
+        else:
+            # If PDF extraction collapses formatting, keep only sentence-like segments.
+            if len(line.split()) < 8:
+                continue
+            if line.split()[0].lower() in SECTION_BREAK_WORDS:
+                continue
+        if len(line.split()) < 6 or len(line.split()) > 28:
             continue
         bullets.append(line)
         if len(bullets) == limit:
             break
     return bullets
+
+def audit_bullet(bullet_text):
+    words = bullet_text.split()
+    first_word = words[0].lower().rstrip(".,;:()") if words else ""
+    strong = first_word in STRONG_VERBS
+    weak = first_word in WEAK_VERBS
+    has_metric = bool(METRIC_PATTERN.search(bullet_text))
+    word_count = len(words)
+    length_ok = 6 <= word_count <= 25
+
+    issues = []
+    if weak:
+        issues.append("Starts with a weak verb — try a stronger one like 'Developed', 'Led', or 'Reduced'")
+    elif not strong:
+        issues.append("Consider starting with a strong action verb like 'Built', 'Implemented', or 'Designed'")
+    if not has_metric:
+        issues.append("No measurable outcome — add a number like 'reduced load time by 40%' or 'managed team of 5'")
+    if word_count > 25:
+        issues.append(f"Too long ({word_count} words) — trim to under 25 words for readability")
+    elif word_count < 6:
+        issues.append(f"Too short ({word_count} words) — add more context about impact")
+
+    score = sum([strong, has_metric, length_ok])
+    return {
+        "text": bullet_text,
+        "strong_verb": strong,
+        "has_metric": has_metric,
+        "length_ok": length_ok,
+        "issues": issues,
+        "score": score,
+    }
+
+def _match_section_header(line_text):
+    """Check if a line is a resume section header. Returns section name or None."""
+    # Strip decoration: bullets, dashes, colons, pipes, unicode dashes
+    cleaned = re.sub(r"^[\s\-•*|─━═—–]+", "", line_text)
+    cleaned = re.sub(r"[\s\-•*|─━═—–:]+$", "", cleaned)
+    normalized = cleaned.lower().strip()
+    # Skip if too many words (likely not a header)
+    if len(normalized.split()) > 5:
+        return None
+    # Exact match against all keywords
+    for section_name, keywords in SECTION_HEADERS.items():
+        if normalized in keywords:
+            return section_name
+    # Partial/startswith match: "professional experience & internships" -> experience
+    for section_name, keywords in SECTION_HEADERS.items():
+        for kw in keywords:
+            if normalized.startswith(kw) or kw.startswith(normalized):
+                if len(normalized) >= 4:  # avoid matching too-short fragments
+                    return section_name
+    # Word-level match: if the line is short and contains a key section word
+    section_core_words = {
+        "experience": "experience", "skills": "skills", "education": "education",
+        "projects": "projects", "summary": "summary", "objective": "summary",
+        "competencies": "skills", "qualifications": "skills",
+    }
+    words = normalized.split()
+    if len(words) <= 4:
+        for word in words:
+            word_clean = word.rstrip("s") if len(word) > 5 else word
+            if word in section_core_words:
+                return section_core_words[word]
+            if word_clean in section_core_words:
+                return section_core_words[word_clean]
+    return None
+
+def _extract_sections_by_lines(text):
+    """Try to extract sections using line-by-line header detection."""
+    lines = text.replace("\r", "\n").split("\n")
+    sections = {}
+    current_section = "header"
+    current_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        matched_section = _match_section_header(stripped)
+        if matched_section and len(stripped.split()) <= 5:
+            if current_lines:
+                joined = " ".join(current_lines).strip()
+                if joined:
+                    sections[current_section] = sections.get(current_section, "") + " " + joined
+            current_section = matched_section
+            current_lines = []
+        else:
+            current_lines.append(stripped)
+
+    if current_lines:
+        joined = " ".join(current_lines).strip()
+        if joined:
+            sections[current_section] = sections.get(current_section, "") + " " + joined
+
+    sections.pop("header", None)
+    return sections
+
+# Regex pattern to find section headers even in collapsed single-line text.
+# Matches common ALL-CAPS or Title-Case headers that appear as word boundaries.
+_SECTION_REGEX = re.compile(
+    r'(?:^|\s)'
+    r'(EXPERIENCE|WORK\s+EXPERIENCE|PROFESSIONAL\s+EXPERIENCE|RELEVANT\s+EXPERIENCE'
+    r'|PROJECTS|PERSONAL\s+PROJECTS|ACADEMIC\s+PROJECTS|KEY\s+PROJECTS'
+    r'|EDUCATION|ACADEMIC\s+BACKGROUND'
+    r'|SKILLS|TECHNICAL\s+SKILLS|CORE\s+COMPETENCIES|KEY\s+SKILLS'
+    r'|SUMMARY|PROFESSIONAL\s+SUMMARY|OBJECTIVE|CAREER\s+SUMMARY'
+    r'|Experience|Work\s+Experience|Professional\s+Experience'
+    r'|Projects|Personal\s+Projects'
+    r'|Education|Academic\s+Background'
+    r'|Skills|Technical\s+Skills|Core\s+Competencies'
+    r'|Summary|Professional\s+Summary|Objective)'
+    r'[\s:]*(?=\s|$)',
+    re.MULTILINE
+)
+
+_HEADER_TO_SECTION = {
+    "experience": "experience", "work experience": "experience",
+    "professional experience": "experience", "relevant experience": "experience",
+    "projects": "projects", "personal projects": "projects",
+    "academic projects": "projects", "key projects": "projects",
+    "education": "education", "academic background": "education",
+    "skills": "skills", "technical skills": "skills",
+    "core competencies": "skills", "key skills": "skills",
+    "summary": "summary", "professional summary": "summary",
+    "objective": "summary", "career summary": "summary",
+}
+
+def _extract_sections_by_regex(text):
+    """Fallback: find section headers via regex, even in collapsed text."""
+    matches = list(_SECTION_REGEX.finditer(text))
+    if len(matches) < 2:
+        return {}
+    sections = {}
+    for i, m in enumerate(matches):
+        header_text = m.group(1).strip().rstrip(":").strip()
+        section_name = _HEADER_TO_SECTION.get(header_text.lower())
+        if not section_name:
+            continue
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        content = text[start:end].strip()
+        if content:
+            sections[section_name] = sections.get(section_name, "") + " " + content
+    return sections
+
+def extract_sections(resume_text):
+    # First try line-based detection (works well when newlines are preserved)
+    sections = _extract_sections_by_lines(resume_text)
+    if len(sections) >= 2:
+        return sections
+    # Fallback: regex-based detection for collapsed text or messy PDF extraction
+    sections = _extract_sections_by_regex(resume_text)
+    if len(sections) >= 2:
+        return sections
+    return {}
+
+def score_sections(sections, job_text, model):
+    if not sections:
+        return {}
+    section_names = list(sections.keys())
+    section_texts = [sections[name] for name in section_names]
+    all_texts = section_texts + [job_text]
+    all_embs = model.encode(
+        all_texts,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )
+    section_embs = all_embs[:-1]
+    job_emb = all_embs[-1].reshape(1, -1)
+    scores = {}
+    for i, name in enumerate(section_names):
+        sim = float(cosine_similarity(section_embs[i].reshape(1, -1), job_emb)[0][0])
+        scores[name] = round(sim * 100, 1)
+    return scores
+
+def prioritize_missing_keywords(missing, resume_emb_vec, jobs_emb, jobs_meta, pool_size=50):
+    if jobs_emb is None or resume_emb_vec is None or not missing:
+        return [(kw, "LOW") for kw in missing]
+    sims = cosine_similarity(resume_emb_vec.reshape(1, -1), jobs_emb)[0]
+    pool_idx = np.argsort(sims)[::-1][:pool_size]
+    pool_texts = [str(jobs_meta.iloc[i].get("master_text", "")).lower() for i in pool_idx]
+    results = []
+    for kw in missing:
+        # Use lenient matching: for multi-word terms, check if any significant
+        # word from the keyword appears in each job text
+        kw_words = [normalize_keyword_word(w) for w in re.findall(r"[a-z0-9]+", kw.lower())]
+        significant = [w for w in kw_words if w not in COMMON_WORDS and w not in JOB_POSTING_NOISE and len(w) >= 3]
+        if not significant:
+            results.append((kw, 0, "LOW"))
+            continue
+        count = 0
+        for text in pool_texts:
+            text_words = {normalize_keyword_word(w) for w in re.findall(r"[a-z0-9]+", text)}
+            matched = sum(1 for w in significant if w in text_words)
+            # Count as a hit if at least half the significant words appear
+            if matched >= max(1, len(significant) // 2):
+                count += 1
+        if count >= 30:
+            priority = "HIGH"
+        elif count >= 15:
+            priority = "MED"
+        else:
+            priority = "LOW"
+        results.append((kw, count, priority))
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
 
 def build_summary_suggestion(title, present, missing):
     title_text = normalize_title(title).title() if title and title != "Target Role" else "Professional"
@@ -371,13 +668,14 @@ def build_bullet_rewrites(resume_text, present, missing, limit=3):
         selected_terms = bullet_terms[:2] if bullet_terms else anchor_terms[:2]
         if not selected_terms:
             continue
-        words = bullet.split()
-        base = " ".join(words[:16]) + ("..." if len(words) > 16 else "")
+        before = bullet
+        if len(before.split()) > 18:
+            before = " ".join(before.split()[:18]) + "..."
         if len(selected_terms) == 1:
-            after = f"Reframed to emphasize **{selected_terms[0]}** while keeping the original accomplishment and measurable impact."
+            after = f"{before} Reframed to emphasize **{selected_terms[0]}** while keeping the original accomplishment and measurable impact."
         else:
-            after = f"Reframed to emphasize **{selected_terms[0]}** and **{selected_terms[1]}** while keeping the original accomplishment and measurable impact."
-        rewrites.append({"before": bullet, "after": f"{base} {after}"})
+            after = f"{before} Reframed to emphasize **{selected_terms[0]}** and **{selected_terms[1]}** while keeping the original accomplishment and measurable impact."
+        rewrites.append({"before": before, "after": after})
         if len(rewrites) == limit:
             break
 
@@ -442,24 +740,14 @@ def select_candidate_pool(similarities, pool_size=200):
 def select_diverse_matches_from_ranked(ranked_matches, top_n):
     selected = []
     seen_titles = set()
-    seen_families = {}
 
     for match in ranked_matches:
         row = match["row"]
         title_key = normalize_title(row.get("title", ""))
-        family_key = role_family_key(row.get("title", ""))
-        desc_terms = significant_terms(row.get("description", ""), limit=10)
         if title_key in seen_titles:
             continue
-        prior_terms = seen_families.get(family_key)
-        if prior_terms and desc_terms:
-            overlap = len(prior_terms & desc_terms) / max(1, min(len(prior_terms), len(desc_terms)))
-            if overlap >= 0.65:
-                continue
         selected.append(match)
         seen_titles.add(title_key)
-        if desc_terms:
-            seen_families[family_key] = desc_terms
         if len(selected) == top_n:
             return selected
 
@@ -537,18 +825,49 @@ def score_resume_vs_job(resume_text, job_text, model):
     return final_score, present, missing
 
 # ─── Resume tailoring advice ──────────────────────────────────────────────────
-def generate_tailoring_advice(present, missing, resume_text, job_text, title="this role"):
+def generate_tailoring_advice(present, missing, resume_text, job_text, title="this role", resume_text_raw=None):
     advice = []
     present = clean_keywords(present, limit=12)
     missing = clean_keywords(missing, limit=12)
+    raw = resume_text_raw if resume_text_raw else resume_text
 
     if missing:
+        skill_terms = [k for k in missing if len(k.split()) <= 2][:4]
+        phrase_terms = [k for k in missing if len(k.split()) > 2][:4]
+        content_parts = ["These terms appear in the job description but not in your resume:\n"]
+        if skill_terms:
+            content_parts.append(f"**For your Skills section:** {', '.join(skill_terms)}")
+        if phrase_terms:
+            content_parts.append(f"**Weave into bullet points:** {', '.join(phrase_terms)}")
+        if not skill_terms and not phrase_terms:
+            content_parts.append(f"**{', '.join(missing[:8])}**")
         advice.append({
             "title": "🔑 Keywords to Add to Your Resume",
-            "content": "The following terms appear in the job description but not in your resume. "
-                       "Work these into your bullet points, skills section, or summary naturally:\n\n"
-                       f"**{', '.join(missing[:8])}**",
+            "content": "\n\n".join(content_parts),
             "type": "keywords"
+        })
+
+    bullets = extract_resume_bullets(raw, limit=10)
+    if bullets:
+        audits = [audit_bullet(b) for b in bullets]
+        passing = sum(1 for a in audits if a["score"] == 3)
+        total_bullets = len(audits)
+        lines = [f"**{passing}/{total_bullets}** bullets pass all checks (strong verb + metric + good length).\n"]
+        for a in audits:
+            verb_mark = "+" if a["strong_verb"] else "-"
+            metric_mark = "+" if a["has_metric"] else "-"
+            length_mark = "+" if a["length_ok"] else "-"
+            truncated = " ".join(a["text"].split()[:18]) + ("..." if len(a["text"].split()) > 18 else "")
+            lines.append(f"**[{verb_mark}] Verb  [{metric_mark}] Metric  [{length_mark}] Length**")
+            lines.append(f"> {truncated}")
+            if a["issues"]:
+                for issue in a["issues"]:
+                    lines.append(f"- {issue}")
+            lines.append("")
+        advice.append({
+            "title": "✏️ Bullet Quality Check",
+            "content": "\n".join(lines),
+            "type": "bullets"
         })
 
     missing_skills = [k for k in missing if len(k.split()) <= 2][:6]
@@ -599,7 +918,7 @@ def interpret(score_pct):
 def compact_keywords(keywords, limit):
     return ", ".join(keywords[:limit]) if keywords else "None detected"
 
-def render_match_cards(matches, resume_text):
+def render_match_cards(matches, resume_text, resume_text_raw=None):
     if not matches:
         st.warning("No distinct roles were found in the dataset for this resume.")
         return
@@ -674,7 +993,8 @@ def render_match_cards(matches, resume_text):
                     missing,
                     resume_text,
                     row.get("master_text", ""),
-                    title=row.get("title", "this role")
+                    title=row.get("title", "this role"),
+                    resume_text_raw=resume_text_raw,
                 )
                 for advice in advice_list:
                     st.markdown(f"**{advice['title']}**")
@@ -728,6 +1048,26 @@ st.markdown("""
         background: #f38ba822;
         color: #f38ba8;
         border: 1px solid #f38ba844;
+        border-radius: 6px;
+        padding: 3px 10px;
+        margin: 3px;
+        font-size: 13px;
+    }
+    .tag-med {
+        display: inline-block;
+        background: #f9e2af22;
+        color: #f9e2af;
+        border: 1px solid #f9e2af44;
+        border-radius: 6px;
+        padding: 3px 10px;
+        margin: 3px;
+        font-size: 13px;
+    }
+    .tag-low {
+        display: inline-block;
+        background: #6c708222;
+        color: #6c7082;
+        border: 1px solid #6c708244;
         border-radius: 6px;
         padding: 3px 10px;
         margin: 3px;
@@ -812,10 +1152,11 @@ with col1:
                 st.error("Could not extract text from file. Try copy-pasting instead.")
 
 with col2:
-    st.subheader("Job Description")
+    st.subheader("Job Description (optional)")
     st.caption("Paste a specific job to compare directly — or leave blank to search your full dataset.")
     job_text = st.text_area("Paste job description", height=320, placeholder="Paste job posting here...")
 
+resume_text_raw = resume_text  # preserve newlines for bullet/section extraction
 resume_text = clean_text(resume_text)
 job_text = clean_text(job_text)
 
@@ -863,6 +1204,33 @@ if run:
         </div>
         """, unsafe_allow_html=True)
 
+        # ── Section-level scoring ────────────────────────────────────────────
+        sections = extract_sections(resume_text_raw)
+        if sections:
+            section_scores = score_sections(sections, job_text, model)
+            if section_scores:
+                st.markdown("### 📊 Section-Level Match Breakdown")
+                st.caption("How each section of your resume matches the job description.")
+                section_display_names = {
+                    "summary": "Summary / Objective",
+                    "experience": "Experience",
+                    "skills": "Skills",
+                    "education": "Education",
+                    "projects": "Projects",
+                }
+                for sec_name, sec_score in sorted(section_scores.items(), key=lambda x: x[1], reverse=True):
+                    display_name = section_display_names.get(sec_name, sec_name.title())
+                    if sec_score >= 50:
+                        bar_color = "#a6e3a1"
+                    elif sec_score >= 35:
+                        bar_color = "#f9e2af"
+                    else:
+                        bar_color = "#f38ba8"
+                    st.markdown(f"**{display_name}** — {sec_score}%")
+                    st.progress(min(sec_score / 100.0, 1.0))
+        else:
+            st.info("Section-level breakdown requires clearly labeled sections (e.g. 'Experience', 'Skills') in your resume.")
+
         st.markdown("---")
 
         # ── Keyword tags ──────────────────────────────────────────────────────
@@ -880,8 +1248,30 @@ if run:
         with right:
             st.subheader(f"❌ Keywords Missing ({len(missing)})")
             if missing:
-                tags = "".join(f'<span class="tag-missing">{k}</span>' for k in missing[:25])
-                st.markdown(tags, unsafe_allow_html=True)
+                if jobs_emb is not None:
+                    resume_emb_vec = model.encode(
+                        [resume_text],
+                        normalize_embeddings=True,
+                        convert_to_numpy=True,
+                        show_progress_bar=False,
+                    )[0]
+                    prioritized = prioritize_missing_keywords(missing, resume_emb_vec, jobs_emb, jobs_meta)
+                    for priority_label, css_class, priority_desc in [
+                        ("HIGH", "tag-missing", "Common across similar jobs — add these first"),
+                        ("MED", "tag-med", "Appears in some similar jobs"),
+                        ("LOW", "tag-low", "Specific to this posting"),
+                    ]:
+                        group = [kw for kw, _count, p in prioritized if p == priority_label]
+                        if group:
+                            st.markdown(f"**{priority_label}** — {priority_desc}")
+                            tags = "".join(
+                                f'<span class="{css_class}">{kw}</span>'
+                                for kw in group
+                            )
+                            st.markdown(tags, unsafe_allow_html=True)
+                else:
+                    tags = "".join(f'<span class="tag-missing">{k}</span>' for k in missing[:25])
+                    st.markdown(tags, unsafe_allow_html=True)
             else:
                 st.write("Great — most key terms found!")
 
@@ -891,7 +1281,7 @@ if run:
         st.subheader("📋 How to Tailor Your Resume for This Job")
         st.caption("Specific, actionable steps to improve your match for this role.")
 
-        advice_list = generate_tailoring_advice(present, missing, resume_text, job_text, title="Target Role")
+        advice_list = generate_tailoring_advice(present, missing, resume_text, job_text, title="Target Role", resume_text_raw=resume_text_raw)
 
         for advice in advice_list:
             with st.expander(advice["title"], expanded=True):
@@ -906,7 +1296,7 @@ if run:
                 convert_to_numpy=True
             )[0]
             sims = cosine_similarity(resume_emb_vec.reshape(1, -1), jobs_emb)[0]
-            candidate_idx = select_candidate_pool(sims, pool_size=max(120, top_n * 20))
+            candidate_idx = select_candidate_pool(sims, pool_size=max(300, top_n * 40))
 
         st.subheader(f"Top {top_n} Matching Jobs from Your Dataset")
         st.caption("Results are rescored on a larger candidate pool, then de-duplicated by role family and grouped by fit tier.")
@@ -938,7 +1328,7 @@ if run:
 
         ranked_matches.sort(key=lambda match: match["blended"], reverse=True)
         final_matches = select_diverse_matches_from_ranked(ranked_matches, top_n=top_n)
-        render_match_cards(final_matches, resume_text)
+        render_match_cards(final_matches, resume_text, resume_text_raw=resume_text_raw)
 
     else:
         st.error("No job description pasted and no dataset loaded. Run `backend.py` first.")
