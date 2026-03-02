@@ -551,18 +551,6 @@ def generate_tailoring_advice(present, missing, resume_text, job_text, title="th
             "type": "keywords"
         })
 
-    rewrites = build_bullet_rewrites(resume_text, present, missing, limit=3)
-    if rewrites:
-        rewrite_lines = []
-        for rewrite in rewrites:
-            rewrite_lines.append(f"**Before:** {rewrite['before']}")
-            rewrite_lines.append(f"**After:** {rewrite['after']}")
-        advice.append({
-            "title": "✏️ How to Rewrite Your Bullet Points",
-            "content": "Use your existing resume bullets, but reframe them with the job's language:\n\n" + "\n\n".join(rewrite_lines),
-            "type": "bullets"
-        })
-
     missing_skills = [k for k in missing if len(k.split()) <= 2][:6]
     if missing_skills:
         advice.append({
